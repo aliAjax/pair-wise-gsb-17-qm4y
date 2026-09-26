@@ -1,161 +1,294 @@
+import { useEffect, useMemo, useState } from "react";
 import "./styles.css";
+import type {
+  CirculationRecord,
+  StabilityReading,
+  TreatmentCase,
+} from "./types";
+import {
+  recomputeConsumption,
+  reconcileCases,
+  uid,
+} from "./lib/domain";
+import { STORAGE_KEYS, usePersistentState } from "./lib/storage";
+import { buildSeed } from "./lib/seed";
+import { MetricCard } from "./components/MetricCard";
+import { CirculationTab } from "./components/CirculationTab";
+import { PendingTab } from "./components/PendingTab";
+import { HistoryTab } from "./components/HistoryTab";
 
-const project = {
-  "id": "hxwl-03",
-  "port": 5103,
-  "title": "岩土钻孔编录",
-  "subtitle": "钻孔分层、标贯与地下水位的现场记录面板",
-  "stack": "React + Vite + TypeScript + CSS",
-  "theme": [
-    "#92400e",
-    "#0f766e",
-    "#2563eb"
-  ],
-  "domain": "岩土工程",
-  "users": [
-    "岩土工程师",
-    "现场编录员",
-    "项目负责人"
-  ],
-  "metrics": [
-    "累计孔深",
-    "地层数量",
-    "最高标贯",
-    "地下水位"
-  ],
-  "filters": [
-    "黏土",
-    "粉砂",
-    "卵石",
-    "强风化"
-  ],
-  "fields": [
-    "钻孔编号",
-    "孔深",
-    "分层深度",
-    "岩性描述",
-    "土色",
-    "标贯击数",
-    "地下水位"
-  ],
-  "records": [
-    [
-      "ZK-18",
-      "22.6m",
-      "粉质黏土",
-      "中密",
-      "标贯12击，水位3.4m"
-    ],
-    [
-      "ZK-21",
-      "31.2m",
-      "卵石层",
-      "稍密",
-      "夹中粗砂，取样困难"
-    ],
-    [
-      "ZK-24",
-      "18.4m",
-      "强风化泥岩",
-      "硬塑",
-      "芯样完整率62%"
-    ]
-  ]
-};
+type Tab = "circulation" | "pending" | "history";
 
-const statusColors = ["status-ok", "status-watch", "status-danger"];
-
-function MetricCard({ label, value, index }: { label: string; value: string; index: number }) {
-  return (
-    <article className="metric-card">
-      <span>{label}</span>
-      <strong>{value}</strong>
-      <i className={statusColors[index % statusColors.length]} />
-    </article>
-  );
-}
+const TABS: { key: Tab; label: string }[] = [
+  { key: "circulation", label: "循环记录" },
+  { key: "pending", label: "待处理" },
+  { key: "history", label: "处置历史" },
+];
 
 function App() {
-  const values = project.metrics.map((metric: string, index: number) => {
-    const base = [84, 12, 31, 7][index % 4];
-    return String(base + index * 3);
-  });
+  const [rawRecords, setRawRecords] = usePersistentState<CirculationRecord[]>(
+    STORAGE_KEYS.records,
+    []
+  );
+  const [cases, setCases] = usePersistentState<TreatmentCase[]>(
+    STORAGE_KEYS.cases,
+    []
+  );
+  const [tab, setTab] = useState<Tab>("circulation");
+  const [toast, setToast] = useState("");
+
+  // 每次新增后按同孔前后班重算实际消耗与超两成标记
+  const records = useMemo(
+    () => recomputeConsumption(rawRecords),
+    [rawRecords]
+  );
+
+  // 报警记录 → 待处理事件对账（新增报警才会产生新事件）
+  useEffect(() => {
+    const linked = (list: TreatmentCase[]) =>
+      new Set(
+        list.flatMap((c) => [
+          c.triggerRecordId,
+          ...c.escalations.map((e) => e.recordId),
+        ])
+      );
+    const alarmIds = records.filter((r) => r.alarm).map((r) => r.id);
+    const already = linked(cases);
+    if (!alarmIds.some((id) => !already.has(id))) return;
+    setCases(reconcileCases(records, cases));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [records]);
+
+  const pendingCases = cases.filter((c) => c.status === "pending");
+  const lockedHoles = useMemo(
+    () => new Set(pendingCases.map((c) => c.holeId)),
+    [pendingCases]
+  );
+
+  const totalConsumption = useMemo(
+    () =>
+      records.reduce(
+        (sum, r) => sum + (r.firstInHole ? 0 : r.consumption ?? 0),
+        0
+      ),
+    [records]
+  );
+  const holeCount = new Set(records.map((r) => r.holeId)).size;
+
+  const notify = (msg: string) => {
+    setToast(msg);
+    window.setTimeout(() => setToast(""), 3600);
+  };
+
+  const addRecord = (
+    input: Omit<CirculationRecord, "id" | "createdAt" | "consumption">
+  ) => {
+    const rec: CirculationRecord = {
+      ...input,
+      id: uid("rec"),
+      createdAt: new Date().toISOString(),
+    };
+    setRawRecords((list) => [...list, rec]);
+    // 先用同孔前班已重算的消耗预判是否超两成，提交后直接引导到处置页
+    const prev = records
+      .filter((r) => r.holeId === rec.holeId)
+      .sort(
+        (a, b) =>
+          new Date(b.observedAt).getTime() - new Date(a.observedAt).getTime()
+      )[0];
+    if (prev?.consumption !== undefined && prev.consumption > 0) {
+      const consumption =
+        rec.injected -
+        rec.returned +
+        (prev.tankRemaining - rec.tankRemaining);
+      if (consumption > prev.consumption * 1.2) {
+        notify(
+          `${rec.holeId} 本班消耗 ${consumption.toFixed(
+            1
+          )}m³，较前班高出两成，已立案并锁定孔位`
+        );
+        setTab("pending");
+        return;
+      }
+    }
+    notify("本班循环记录已登记");
+  };
+
+  const updateCase = (id: string, patch: Partial<TreatmentCase>) =>
+    setCases((list) =>
+      list.map((c) => (c.id === id ? { ...c, ...patch } : c))
+    );
+
+  const addReading = (id: string, reading: StabilityReading) =>
+    setCases((list) =>
+      list.map((c) =>
+        c.id === id ? { ...c, readings: [...c.readings, reading] } : c
+      )
+    );
+
+  const removeReading = (caseId: string, readingId: string) =>
+    setCases((list) =>
+      list.map((c) =>
+        c.id === caseId
+          ? { ...c, readings: c.readings.filter((r) => r.id !== readingId) }
+          : c
+      )
+    );
+
+  const resolveCase = (id: string) => {
+    const target = cases.find((c) => c.id === id);
+    if (!target) return;
+    if (
+      !target.sealMaterial.trim() ||
+      !target.responsible.trim() ||
+      !target.recoveryResult.trim()
+    ) {
+      notify("封堵材料、责任人、恢复结果均为必填");
+      return;
+    }
+    setCases((list) =>
+      list.map((c) =>
+        c.id === id
+          ? { ...c, status: "resolved", resolvedAt: new Date().toISOString() }
+          : c
+      )
+    );
+    notify(`${target.holeId} 已解锁，恢复钻进；事件归档至处置历史`);
+  };
+
+  const loadSeed = () => {
+    const seed = buildSeed();
+    setRawRecords(seed.records);
+    // 同步重算消耗并对账出 ZK-18 的待处理事件，再回填演示处置信息；
+    // 此后 effect 复查时报警均已关联，不会重复立案
+    const seeded = recomputeConsumption(seed.records);
+    setCases(seed.prepareCases(reconcileCases(seeded, [])));
+    setTab("circulation");
+    notify("已载入演示数据（ZK-18 为待处理锁定状态）");
+  };
+
+  const clearAll = () => {
+    if (!window.confirm("确认清空全部循环记录与处置历史？此操作不可恢复。"))
+      return;
+    setRawRecords([]);
+    setCases([]);
+    setTab("circulation");
+    notify("已清空全部数据");
+  };
 
   return (
     <main className="app-shell">
       <section className="hero">
         <div>
-          <p className="eyebrow">{project.id} · port {project.port}</p>
-          <h1>{project.title}</h1>
-          <p className="subtitle">{project.subtitle}</p>
+          <p className="eyebrow">现场泥浆管控 · 端口 5103</p>
+          <h1>泥浆循环与漏失处置台</h1>
+          <p className="subtitle">
+            按班登记罐余量、注入量、回流量与观测时刻，自动核算前后班实际消耗；
+            消耗较前班高出两成即立案锁定，封堵材料、责任人、两次间隔不少于
+            1 小时的稳定回流和恢复结果齐备后方可解锁恢复钻进。
+          </p>
         </div>
         <div className="stack-card">
-          <span>技术栈</span>
-          <strong>{project.stack}</strong>
+          <span>记录与处置</span>
+          <strong>
+            循环台账与处置历史分开保存，重开页面自动恢复，继续处理未结事件
+          </strong>
+          <div className="hero-actions">
+            <button onClick={loadSeed}>载入演示数据</button>
+            <button onClick={clearAll}>清空全部</button>
+          </div>
         </div>
       </section>
 
       <section className="metrics-grid">
-        {project.metrics.map((metric: string, index: number) => (
-          <MetricCard key={metric} label={metric} value={values[index]} index={index} />
-        ))}
+        <MetricCard
+          label="在管钻孔"
+          value={holeCount}
+          unit="个"
+          tone="ok"
+          hint="已登记循环记录的孔号"
+        />
+        <MetricCard
+          label="循环班次记录"
+          value={records.length}
+          unit="班"
+          tone="ok"
+          hint="首班为基准班不参与对比"
+        />
+        <MetricCard
+          label="累计实际消耗"
+          value={totalConsumption.toFixed(1)}
+          unit="m³"
+          tone="watch"
+          hint="按同孔前后班罐余推算"
+        />
+        <MetricCard
+          label="待处理 / 锁定孔"
+          value={pendingCases.length}
+          unit="个"
+          tone={pendingCases.length ? "danger" : "ok"}
+          hint={
+            pendingCases.length
+              ? `锁定：${pendingCases.map((c) => c.holeId).join("、")}`
+              : "无漏失事件，钻进正常"
+          }
+        />
       </section>
 
-      <section className="workspace">
-        <aside className="panel narrow">
-          <h2>角色</h2>
-          <div className="chips">
-            {project.users.map((user: string) => (
-              <span key={user}>{user}</span>
-            ))}
-          </div>
-          <h2>筛选</h2>
-          <div className="chips muted">
-            {project.filters.map((filter: string) => (
-              <button key={filter}>{filter}</button>
-            ))}
-          </div>
-        </aside>
-
-        <section className="panel">
-          <div className="section-heading">
-            <div>
-              <p>{project.domain}</p>
-              <h2>记录字段</h2>
-            </div>
-            <button className="primary-action">新增记录</button>
-          </div>
-          <div className="field-grid">
-            {project.fields.map((field: string) => (
-              <label key={field}>
-                <span>{field}</span>
-                <input placeholder={"填写" + field} />
-              </label>
-            ))}
-          </div>
+      {lockedHoles.size > 0 && (
+        <section className="lock-strip">
+          <strong>孔位锁定</strong>
+          <span>
+            {Array.from(lockedHoles).join("、")} 正在漏失处置中，未完成
+            “材料 · 责任人 · 两次稳定回流(≥1小时) · 恢复结果”前禁止恢复钻进与新增本班记录。
+          </span>
         </section>
-      </section>
+      )}
 
-      <section className="records panel">
-        <div className="section-heading">
-          <div>
-            <p>示例数据</p>
-            <h2>近期记录</h2>
-          </div>
-          <button>导出摘要</button>
-        </div>
-        <div className="record-list">
-          {project.records.map((record: string[], index: number) => (
-            <article key={record.join("-")} className="record-card">
-              <div className="record-index">{String(index + 1).padStart(2, "0")}</div>
-              <div>
-                <h3>{record[0]}</h3>
-                <p>{record.slice(1).join(" · ")}</p>
-              </div>
-            </article>
-          ))}
-        </div>
-      </section>
+      <nav className="tabs">
+        {TABS.map((t) => (
+          <button
+            key={t.key}
+            className={`tab-btn ${tab === t.key ? "active" : ""}`}
+            onClick={() => setTab(t.key)}
+          >
+            {t.label}
+            {t.key === "pending" && pendingCases.length > 0 ? (
+              <span className="tab-count">{pendingCases.length}</span>
+            ) : null}
+            {t.key === "history" ? (
+              <span className="tab-count muted">
+                {cases.filter((c) => c.status === "resolved").length}
+              </span>
+            ) : null}
+          </button>
+        ))}
+      </nav>
+
+      {tab === "circulation" && (
+        <CirculationTab
+          records={records}
+          lockedHoles={lockedHoles}
+          onAdd={addRecord}
+        />
+      )}
+      {tab === "pending" && (
+        <PendingTab
+          cases={cases}
+          onUpdate={updateCase}
+          onAddReading={addReading}
+          onRemoveReading={removeReading}
+          onResolve={resolveCase}
+        />
+      )}
+      {tab === "history" && <HistoryTab cases={cases} />}
+
+      <footer className="app-foot">
+        循环记录存于 <code>{STORAGE_KEYS.records}</code>，处置历史存于{" "}
+        <code>{STORAGE_KEYS.cases}</code>，二者独立持久化。
+      </footer>
+
+      {toast ? <div className="toast">{toast}</div> : null}
     </main>
   );
 }
